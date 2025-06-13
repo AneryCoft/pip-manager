@@ -8,6 +8,9 @@ import * as utils from '@/utils';
 import { createDecorator } from '@/common/ioc/common/instantiation';
 import { IExtensionContext, IOutputChannel } from '@/interface/common';
 import { InstantiationService, ServiceCollection } from '@/common/ioc';
+import wrapper from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
+import * as crypto from 'crypto';
 
 interface PackageInfo {
     name: string;
@@ -56,7 +59,10 @@ export interface IPackageManager {
 export const IPackageManager = createDecorator<IPackageManager>('packageManager');
 
 export class PackageManager implements IPackageManager {
+    private client: ReturnType<typeof wrapper>;
+    private jar: CookieJar;
     private source: string = Source.tsinghua;
+
     constructor(
         private _pythonPath: string,
         @IOutputChannel private readonly output: IOutputChannel,
@@ -66,6 +72,69 @@ export class PackageManager implements IPackageManager {
         this.context.subscriptions.push(
             vscode.workspace.onDidChangeConfiguration(this.onConfigUpdate.bind(this))
         );
+        this.jar = new CookieJar();
+        this.client = wrapper(axios.create({ jar: this.jar, withCredentials: true }));
+
+        this.preVerifyClient();
+    }
+
+    public getAnswer(base: string, hash: string): string {
+        const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        for (let i = 0; i < chars.length; i++) {
+            for (let j = 0; j < chars.length; j++) {
+                const candidate = base + chars[i] + chars[j];
+                const candidateHash = crypto.createHash('sha256').update(candidate).digest('hex');
+                if (candidateHash === hash) {
+                    return chars[i] + chars[j];
+                }
+            }
+        }
+        return '';
+    }
+
+    private async preVerifyClient() {
+        const url = `https://pypi.org/search/`;
+
+        let resp = await this.client.get(url);
+
+        const scriptUrlMatch = resp.data.match(/script\.src = '(.+?)'/);
+        if (!scriptUrlMatch) { throw new Error('Cant match script.src'); }
+
+        const scriptUrl = `https://pypi.org${scriptUrlMatch[1]}`;
+        const scriptResp = await this.client.get(scriptUrl);
+
+
+        const match = scriptResp.data.match(/init\((\[[\s\S]*?\]),\s*"([^"]+)",\s*"([^"]+)"/);
+        if (!match) { throw new Error('Cant match init'); }
+
+        // calc answer
+        const powArr = JSON.parse(match[1]);
+        const powData = powArr[0].data;
+        const base = powData.base;
+        const hash = powData.hash;
+        const hmac = powData.hmac;
+        const expires = powData.expires;
+        const token = match[2];
+        const postPath = match[3];
+
+        const answer = this.getAnswer(base, hash);
+
+        const body = {
+            token: token,
+            data: [
+                {
+                    ty: "pow",
+                    base: base,
+                    answer: answer,
+                    hmac: hmac,
+                    expires: expires
+                }
+            ]
+        };
+        let verify = await this.client.post(`https://pypi.org${postPath}/fst-post-back`, body);
+
+        if (verify.status === 200)
+            {return true;}
     }
 
     static Create(instantiation: InstantiationService, service: ServiceCollection | undefined, pythonPath: string) {
@@ -305,26 +374,64 @@ export class PackageManager implements IPackageManager {
     }
 
     public async searchFromPyPi(keyword: string, page = 1, cancelToken?: vscode.CancellationToken) {
-        const axiosCancelToken = utils.createAxiosCancelToken(cancelToken);
-        const resp = await axios({
-            method: 'GET',
-            cancelToken: axiosCancelToken.token,
-            url: `https://pypi.org/search/?q=${keyword}&page=${page}${keyword ? '' : `&c=${defaultCategory}`
-                }`,
-        });
+        const searchUrl = `https://pypi.org/search/?q=${encodeURIComponent(keyword)}&page=${page}`;
+        let resp = await this.client.get(searchUrl);
+
+        const html = resp.data;
+
+        /*
         const [resultXml] =
             RegExp(
                 '<ul class="unstyled" aria-label="Search results">[\\s\\S]*?</ul>'
             ).exec(resp.data) || [];
         if (!resultXml) {return Promise.reject({ type: 'no result' });}
-        const [paginationXml] =
-            RegExp(
-                '<div class="button-group button-group--pagination">[\\s\\S]*?</div>'
-            ).exec(resp.data) || [];
+
         const result = await xml2js.parseStringPromise(resultXml, {
             explicitArray: false,
         });
+        */
+        const [paginationXml] =
+        RegExp(
+            '<div class="button-group button-group--pagination">[\\s\\S]*?</div>'
+        ).exec(resp.data) || [];
 
+        const liMatches = html.match(/<li>[\s\S]*?<\/li>/g) || [];
+
+        const list: PackagePickItem[] = [];
+        interface PyPiSearchResult {
+            name: string;
+            version: string;
+            updateTime: string;
+            alwaysShow: boolean;
+            label: string;
+            description: string;
+            detail: string;
+        }
+
+        liMatches.forEach((liHtml: string) => {
+            const nameMatch: RegExpMatchArray | null = liHtml.match(/<span class="package-snippet__name">([^<]+)<\/span>/);
+            const name: string = nameMatch ? nameMatch[1] : '';
+
+            const timeMatch: RegExpMatchArray | null = liHtml.match(/<time [^>]*datetime="([^"]+)"/);
+            const updateTime: string = timeMatch ? timeMatch[1] : '';
+            
+            const descMatch: RegExpMatchArray | null = liHtml.match(/<p class="package-snippet__description">([\s\S]*?)<\/p>/);
+            const describe: string = descMatch ? descMatch[1].trim() : '';
+
+            const item: PyPiSearchResult = {
+                name,
+                version: '',
+                updateTime,
+                alwaysShow: true,
+                label: name,
+                description: describe,
+                detail: ''
+            };
+
+            list.push(item);
+        });
+
+        /*
         const list: PackagePickItem[] = [];
         result.ul.li.forEach((item: any) => {
             const data = {
@@ -342,6 +449,7 @@ export class PackageManager implements IPackageManager {
                 detail: data.describe
             });
         });
+        */
 
         let totalPages = 1;
 

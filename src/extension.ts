@@ -298,7 +298,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			lastCancelToken?.dispose();
 		});
 
-		updateItemList('', 1);
+		//updateItemList('', 1);
 	});
 
 	commandTool.registerCommand('pip-manager.pickPackageVersion', async (e?: PackageDataItem) => {

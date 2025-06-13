@@ -263,7 +263,7 @@ export class InstantiationService implements IInstantiationService {
 //#region -- tracing ---
 
 const enum TraceType {
-	Creation, Invocation, Branch
+	None = -1, Creation, Invocation, Branch
 }
 
 class Trace {
